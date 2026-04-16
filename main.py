@@ -1,6 +1,6 @@
 # main.py
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import RedirectResponse
+from fastapi import FastAPI, Query, HTTPException, BackgroundTasks
+from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
@@ -14,6 +14,8 @@ import json
 from datetime import datetime
 from emailnator import Emailnator
 import uvicorn
+import asyncio
+from contextlib import asynccontextmanager
 
 # ============================================================
 # CONFIGURATION
@@ -32,6 +34,10 @@ HEADERS = {
     "x-client-info": "supabase-ssr/0.9.0 createBrowserClient",
     "x-supabase-api-version": "2024-01-01"
 }
+
+# Track request count for keep-alive
+request_count = 0
+last_ping_time = datetime.now()
 
 # ============================================================
 # HELPER FUNCTIONS
@@ -290,7 +296,25 @@ async def generate_and_return_image(prompt: str, reference_images: List[str]):
 # ============================================================
 # FASTAPI APPLICATION
 # ============================================================
-app = FastAPI(title="Luno Studio Image Generator API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    print("=" * 70)
+    print("Luno Studio Image Generator API Started")
+    print("=" * 70)
+    print("\n💡 Keep-alive tip: Use /ping endpoint every 5 minutes")
+    print("   to prevent Render.com from sleeping")
+    print("\n✅ API is ready to accept requests")
+    yield
+    # Shutdown
+    print("Shutting down...")
+
+app = FastAPI(
+    title="Luno Studio Image Generator API",
+    description="Generate AI images with prompt and reference images. Includes keep-alive ping endpoint for Render.com",
+    version="1.0.0",
+    lifespan=lifespan
+)
 
 # Enable CORS
 app.add_middleware(
@@ -308,24 +332,79 @@ class GenerateResponse(BaseModel):
     reference_count: int
     error: Optional[str] = None
 
+class PingResponse(BaseModel):
+    status: str
+    message: str
+    timestamp: str
+    server_time: str
+    request_count: int
+    uptime_seconds: Optional[float] = None
+
+# Store start time for uptime calculation
+start_time = datetime.now()
+
 @app.get("/")
 async def root():
     return {
         "service": "Luno Studio Image Generator API",
+        "version": "1.0.0",
         "endpoints": {
-            "/generate": "Generate image with prompt and reference images",
-            "/health": "Health check"
+            "/ping": "Keep-alive endpoint - returns 'pong' with status info",
+            "/generate": "Generate image with prompt and reference images (returns redirect)",
+            "/generate/json": "Generate image and return JSON response",
+            "/health": "Health check endpoint"
         },
         "usage": {
-            "basic": "/generate?prompt=your prompt here",
-            "with_reference": "/generate?prompt=your prompt&ref1=https://example.com/image.png",
-            "multiple_refs": "/generate?prompt=your prompt&ref1=url1.png&ref2=url2.jpg&ref3=url3.png"
+            "ping": "GET /ping",
+            "basic": "GET /generate?prompt=your prompt here",
+            "with_reference": "GET /generate?prompt=your prompt&ref1=https://example.com/image.png",
+            "multiple_refs": "GET /generate?prompt=your prompt&ref1=url1.png&ref2=url2.jpg&ref3=url3.png"
+        },
+        "keep_alive": {
+            "tip": "Use /ping endpoint every 5 minutes to prevent Render.com from sleeping",
+            "cron_example": "*/5 * * * * curl https://your-app.onrender.com/ping"
         }
     }
 
+@app.get("/ping", response_model=PingResponse)
+async def ping_endpoint():
+    """
+    Keep-alive endpoint that returns 'pong'.
+    Use this to prevent your Render.com instance from sleeping.
+    
+    Recommended: Ping every 5 minutes using a cron job or uptime monitoring service.
+    """
+    global request_count, last_ping_time
+    request_count += 1
+    current_time = datetime.now()
+    last_ping_time = current_time
+    
+    # Calculate uptime
+    uptime = (current_time - start_time).total_seconds()
+    
+    print(f"[PING] Request #{request_count} at {current_time.isoformat()}")
+    
+    return PingResponse(
+        status="pong",
+        message="Server is alive and running",
+        timestamp=current_time.isoformat(),
+        server_time=current_time.strftime("%Y-%m-%d %H:%M:%S"),
+        request_count=request_count,
+        uptime_seconds=uptime
+    )
+
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+    """Health check endpoint for monitoring services"""
+    uptime = (datetime.now() - start_time).total_seconds()
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "uptime_seconds": uptime,
+        "uptime_human": f"{int(uptime // 3600)}h {int((uptime % 3600) // 60)}m {int(uptime % 60)}s",
+        "request_count": request_count,
+        "last_ping": last_ping_time.isoformat() if last_ping_time else None
+    }
 
 @app.get("/generate", response_class=RedirectResponse)
 async def generate_image_endpoint(
@@ -413,7 +492,6 @@ async def generate_image_json(
     ref9: Optional[str] = Query(None, description="Reference image URL (must end with .png or .jpg)")
 ):
     """Same as /generate but returns JSON instead of redirect"""
-    # Reuse the same logic as above with return_json=True
     return await generate_image_endpoint(
         prompt=prompt,
         ref1=ref1, ref2=ref2, ref3=ref3, ref4=ref4, ref5=ref5,
@@ -428,12 +506,27 @@ if __name__ == "__main__":
     print("=" * 70)
     print("Luno Studio Image Generator API")
     print("=" * 70)
-    print("\nStarting FastAPI server...")
-    print("\nUsage Examples:")
-    print("  http://localhost:8000/generate?prompt=a beautiful sunset")
-    print("  http://localhost:8000/generate?prompt=cyberpunk city&ref1=https://example.com/image.png")
-    print("  http://localhost:8000/generate?prompt=portrait&ref1=img1.png&ref2=img2.jpg&ref3=img3.png")
-    print("  http://localhost:8000/generate/json?prompt=test&ref1=image.png  # Returns JSON")
-    print("\n" + "=" * 70)
+    print("\n🚀 Starting FastAPI server...")
+    print("\n📋 Available endpoints:")
+    print("   GET /ping        - Keep-alive endpoint (returns 'pong')")
+    print("   GET /health      - Health check with uptime info")
+    print("   GET /generate    - Generate image (redirect)")
+    print("   GET /generate/json - Generate image (JSON response)")
+    print("\n💡 Keep-alive for Render.com:")
+    print("   Use a cron job or uptime robot to ping /ping every 5 minutes")
+    print("   Example: */5 * * * * curl https://your-app.onrender.com/ping")
+    print("\n📝 Usage Examples:")
+    print("   http://localhost:8000/ping")
+    print("   http://localhost:8000/generate?prompt=a beautiful sunset")
+    print("   http://localhost:8000/generate?prompt=cyberpunk city&ref1=https://example.com/image.png")
+    print("   http://localhost:8000/generate/json?prompt=test&ref1=image.png")
+    print("\n📚 API docs: http://localhost:8000/docs")
+    print("=" * 70)
     
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=8000, 
+        log_level="info",
+        timeout_keep_alive=65  # Keep connections alive longer for Render
+    )
